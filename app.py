@@ -50,13 +50,13 @@ def load_transcriber(model_type: str):
 @st.cache_resource
 def load_sepformer():
     from speechbrain.inference.separation import SepformerSeparation
-    from speechbrain.utils.fetching import FetchConfig, LocalStrategy
+    from speechbrain.utils.fetching import LocalStrategy
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     return SepformerSeparation.from_hparams(
         source="speechbrain/sepformer-wham16k-enhancement",
         savedir="pretrained_models/sepformer-wham16k-enhancement",
         run_opts={"device": device_str},
-        fetch_config=FetchConfig(local_strategy=LocalStrategy.COPY),
+        local_strategy=LocalStrategy.COPY,
     )
 
 
