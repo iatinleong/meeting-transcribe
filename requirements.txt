@@ -1,0 +1,9 @@
+torch
+torchaudio
+pyannote.audio
+whisperx
+faster-whisper
+sounddevice
+numpy
+python-dotenv
+deepfilternet

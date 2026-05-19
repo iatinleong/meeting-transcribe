@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+venv/
+
+# Environment variables (contains HF token)
+.env
+
+# Large model files
+breeze-asr-25-ct2/
+tmp_speechbrain/
+
+# Claude Code
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
