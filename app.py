@@ -237,16 +237,28 @@ def apply_enhancement(audio_raw: np.ndarray, sr: int, enhancement: str) -> np.nd
 
     if enhancement == "SepFormer":
         sepformer = load_sepformer()
-        # SepFormer self-attention is O(N²) — chunk to 4-second windows to avoid OOM
-        chunk_samples = 4 * sr
-        results = []
-        for start in range(0, len(audio_raw), chunk_samples):
-            chunk = audio_raw[start : start + chunk_samples]
-            audio_t = torch.from_numpy(chunk).float().unsqueeze(0)  # (1, N)
+        output = audio_raw.copy()
+
+        # Run VAD first to find actual speech segments, then enhance only those
+        waveform = torch.from_numpy(audio_raw).unsqueeze(0).float()
+        vad_results = vad_pipeline({"waveform": waveform, "sample_rate": sr})
+        vad_pipeline.instantiate({"min_duration_on": 0.1, "min_duration_off": 0.1})
+
+        for speech in vad_results.get_timeline().support():
+            start = int(speech.start * sr)
+            end = int(speech.end * sr)
+            segment = audio_raw[start:end]
+            if len(segment) < int(sr * 0.1):
+                continue
+            audio_t = torch.from_numpy(segment).float().unsqueeze(0)
             enhanced = sepformer.separate_batch(audio_t)
             out = enhanced[0, :, 0] if enhanced.dim() == 3 else enhanced[0]
-            results.append(out.detach().cpu().numpy())
-        return np.concatenate(results)
+            enhanced_np = out.detach().cpu().numpy()
+            # SepFormer may return slightly different length due to encoder padding
+            length = min(len(enhanced_np), end - start)
+            output[start : start + length] = enhanced_np[:length]
+
+        return output
 
     return audio_raw
 
