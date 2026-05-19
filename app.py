@@ -20,7 +20,7 @@ st.set_page_config(page_title="Meeting Assistant", layout="wide")
 
 
 @st.cache_resource
-def load_models():
+def load_base_models():
     load_dotenv()
     hf_token = os.getenv("HF_TOKEN")
 
@@ -34,14 +34,28 @@ def load_models():
     if torch.cuda.is_available():
         vad_pipeline.to(torch.device("cuda"))
 
-    transcriber = Transcriber()
     diarizer = Diarizer(hf_token=hf_token)
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     punc_restorer = PunctuationRestorer(device=device_str)
-
     df_model, df_state, _ = init_df()
 
-    return vad_pipeline, transcriber, diarizer, punc_restorer, df_model, df_state
+    return vad_pipeline, diarizer, punc_restorer, df_model, df_state
+
+
+@st.cache_resource
+def load_transcriber(model_type: str):
+    return Transcriber(model_type=model_type)
+
+
+@st.cache_resource
+def load_sepformer():
+    from speechbrain.inference.separation import SepformerSeparation
+    device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    return SepformerSeparation.from_hparams(
+        source="speechbrain/sepformer-wham16k-enhancement",
+        savedir="pretrained_models/sepformer-wham16k-enhancement",
+        run_opts={"device": device_str},
+    )
 
 
 st.title("Meeting Assistant - Streaming Demo")
@@ -50,8 +64,8 @@ st.markdown(
     "then ASR runs on each final speaker segment."
 )
 
-with st.spinner("Loading models..."):
-    vad_pipeline, transcriber, diarizer, punc_restorer, df_model, df_state = load_models()
+with st.spinner("Loading base models..."):
+    vad_pipeline, diarizer, punc_restorer, df_model, df_state = load_base_models()
 
 
 speaker_map = {
@@ -80,41 +94,36 @@ with col1:
 
     silence_threshold = st.slider(
         "End-of-speech silence (sec)",
-        0.5,
-        3.0,
-        1.5,
-        0.1,
+        0.5, 3.0, 1.5, 0.1,
     )
     simulation_speed = st.slider(
         "Simulation speed",
-        0.5,
-        5.0,
-        1.0,
-        0.5,
+        0.5, 5.0, 1.0, 0.5,
     )
-    apply_denoise = st.checkbox(
-        "Apply DeepFilterNet3 denoise before recognition",
-        value=False,
-        help="Neural noise suppression. Effective for background noise, but may slightly affect speaker embeddings.",
+
+    st.markdown("---")
+    st.subheader("ASR Model")
+    asr_model = st.selectbox(
+        "Speech recognition model",
+        ["Breeze ASR 2.5", "SenseVoice"],
+        help="Breeze ASR 2.5: Chinese-optimized, word-level timestamps. SenseVoice: faster, supports emotion detection.",
     )
-    highpass_cutoff = st.slider(
-        "High-pass cutoff (Hz)",
-        min_value=40,
-        max_value=200,
-        value=80,
-        step=10,
-        disabled=not apply_denoise,
-        help="Cut frequencies below this value. Speech starts at ~80 Hz; raise to remove more low-freq noise.",
+
+    st.subheader("Enhancement")
+    enhancement_model = st.selectbox(
+        "Enhancement model",
+        ["None", "DeepFilterNet3", "SepFormer"],
+        help="None: no processing. DeepFilterNet3: neural noise suppression. SepFormer: speech separation.",
     )
-    atten_lim_db = st.slider(
-        "DF3 max attenuation (dB)",
-        min_value=6,
-        max_value=30,
-        value=12,
-        step=1,
-        disabled=not apply_denoise,
-        help="Lower = preserve more voice. Higher = more aggressive noise removal.",
-    )
+    if enhancement_model == "DeepFilterNet3":
+        highpass_cutoff = st.slider(
+            "High-pass cutoff (Hz)", 40, 200, 80, 10,
+            help="Cut frequencies below this value. Speech starts at ~80 Hz.",
+        )
+        atten_lim_db = st.slider(
+            "DF3 max attenuation (dB)", 6, 30, 12, 1,
+            help="Lower = preserve more voice. Higher = more aggressive noise removal.",
+        )
 
     if st.button("Start / Restart", use_container_width=True):
         st.session_state.transcript_text = ""
@@ -133,51 +142,39 @@ with col2:
 
 
 def recursive_vad_split(audio_segment: np.ndarray, sr: int, vad_pipeline, current_threshold: float, min_threshold: float = 0.2):
-    """
-    遞迴地降低靜音閾值，直到音訊片段被切分到小於 30 秒為止。
-    """
     max_samples = int(sr * 30.0)
-    
-    # 如果已經小於 30 秒，或者閾值已經降到極限，就直接回傳 (不再切了)
+
     if len(audio_segment) <= max_samples or current_threshold < min_threshold:
         return [audio_segment]
-        
-    # 嘗試用更嚴格(更短)的靜音閾值來重新切分這段音訊
-    # 這裡我們利用 pyannote 的 binarize 機制，透過降低 min_duration_off 來尋找更短的停頓
+
     vad_pipeline.instantiate({
-        "min_duration_on": 0.1, 
+        "min_duration_on": 0.1,
         "min_duration_off": current_threshold
     })
-    
+
     waveform = torch.from_numpy(audio_segment).unsqueeze(0).float()
-    
+
     try:
         vad_results = vad_pipeline({"waveform": waveform, "sample_rate": sr})
-        
+
         segments = []
         for speech in vad_results.get_timeline().support():
             start_sample = int(speech.start * sr)
             end_sample = int(speech.end * sr)
-            
-            # 如果還是太長，遞迴往下切，閾值再減 0.3 秒
+
             sub_seg = audio_segment[start_sample:end_sample]
             if len(sub_seg) > max_samples:
                 segments.extend(recursive_vad_split(sub_seg, sr, vad_pipeline, current_threshold - 0.3, min_threshold))
             else:
                 segments.append(sub_seg)
-                
-        # 恢復預設的 VAD 參數，以免影響外層的主迴圈
-        vad_pipeline.instantiate({
-            "min_duration_on": 0.1, 
-            "min_duration_off": 0.1 
-        })
-        
-        # 如果模型什麼都沒切出來 (整段完全沒有停頓)，只好硬切
+
+        vad_pipeline.instantiate({"min_duration_on": 0.1, "min_duration_off": 0.1})
+
         if not segments:
             return [audio_segment[i:i+max_samples] for i in range(0, len(audio_segment), max_samples)]
-            
+
         return segments
-        
+
     except Exception as e:
         print(f"遞迴 VAD 切割失敗: {e}，改用硬切")
         return [audio_segment[i:i+max_samples] for i in range(0, len(audio_segment), max_samples)]
@@ -189,32 +186,29 @@ def transcribe_chunk(
     transcriber: Transcriber,
     processed_audio_seconds: float,
     vad_pipeline,
-    initial_silence_threshold: float
+    initial_silence_threshold: float,
 ):
     asr_segments = []
 
     if len(current_audio) < int(sr * 0.3):
         return asr_segments
 
-    # 使用動態遞迴 VAD 取代 30 秒硬切
-    # 初始閾值設定為使用者在介面上設定的值稍微降低一點 (例如 1.5 -> 1.2)
     sub_segments = recursive_vad_split(current_audio, sr, vad_pipeline, initial_silence_threshold - 0.3)
-    
+
     current_offset_samples = 0
     for sub_audio in sub_segments:
         if len(sub_audio) < int(sr * 0.3):
             current_offset_samples += len(sub_audio)
             continue
-            
-        # 如果經過遞迴後還是有超過 30 秒的 (可能講話真的像機關槍完全不停)，最後一道防線硬切
+
         max_samples = int(sr * 30.0)
         for offset in range(0, len(sub_audio), max_samples):
             chunk_to_transcribe = sub_audio[offset:offset + max_samples]
-            
+
             sub_segment_asr = transcriber.transcribe(chunk_to_transcribe, sample_rate=sr)
-            
+
             absolute_offset = ((current_offset_samples + offset) / sr) + processed_audio_seconds
-            
+
             for seg in sub_segment_asr:
                 seg["start"] += absolute_offset
                 seg["end"] += absolute_offset
@@ -225,23 +219,40 @@ def transcribe_chunk(
                         if "end" in word:
                             word["end"] += absolute_offset
                 asr_segments.append(seg)
-                
+
         current_offset_samples += len(sub_audio)
 
     return asr_segments
 
 
+def apply_enhancement(audio_raw: np.ndarray, sr: int, enhancement: str) -> np.ndarray:
+    if enhancement == "DeepFilterNet3":
+        audio_t = torch.from_numpy(audio_raw).unsqueeze(0)
+        audio_t = torchaudio.functional.highpass_biquad(audio_t, sr, cutoff_freq=float(highpass_cutoff))
+        audio_48k = torchaudio.functional.resample(audio_t, sr, df_state.sr())
+        enhanced_48k = df_enhance(df_model, df_state, audio_48k, atten_lim_db=float(atten_lim_db))
+        return torchaudio.functional.resample(enhanced_48k, df_state.sr(), sr).squeeze(0).numpy()
+
+    if enhancement == "SepFormer":
+        sepformer = load_sepformer()
+        audio_t = torch.from_numpy(audio_raw).float().unsqueeze(0)  # (1, N)
+        enhanced = sepformer.separate_batch(audio_t)               # (1, N, sources)
+        if enhanced.dim() == 3:
+            return enhanced[0, :, 0].detach().cpu().numpy()
+        return enhanced[0].detach().cpu().numpy()
+
+    return audio_raw
+
+
 if st.session_state.is_simulating:
+    asr_key = "breeze" if asr_model == "Breeze ASR 2.5" else "sensevoice"
+
+    with st.spinner(f"Loading {asr_model}..."):
+        transcriber = load_transcriber(asr_key)
+
     with st.spinner("Loading audio..."):
         audio_data_raw, sr = librosa.load(audio_file, sr=16000)
-        if apply_denoise:
-            audio_t = torch.from_numpy(audio_data_raw).unsqueeze(0)
-            audio_t = torchaudio.functional.highpass_biquad(audio_t, sr, cutoff_freq=float(highpass_cutoff))
-            audio_48k = torchaudio.functional.resample(audio_t, sr, df_state.sr())
-            enhanced_48k = df_enhance(df_model, df_state, audio_48k, atten_lim_db=float(atten_lim_db))
-            audio_data = torchaudio.functional.resample(enhanced_48k, df_state.sr(), sr).squeeze(0).numpy()
-        else:
-            audio_data = audio_data_raw
+        audio_data = apply_enhancement(audio_data_raw, sr, enhancement_model)
 
         peak = np.max(np.abs(audio_data))
         if peak > 0:
@@ -306,10 +317,9 @@ if st.session_state.is_simulating:
                 transcriber=transcriber,
                 processed_audio_seconds=processed_audio_seconds,
                 vad_pipeline=vad_pipeline,
-                initial_silence_threshold=silence_threshold
+                initial_silence_threshold=silence_threshold,
             )
 
-            # 將 ASR 結果直接輸出 (不使用 diarization_results)
             lines = []
             for seg in asr_segments:
                 text = seg.get("text", "").strip()
@@ -317,8 +327,6 @@ if st.session_state.is_simulating:
                     continue
                 if punc_restorer:
                     text = punc_restorer.restore(text)
-                
-                # 直接加上預設的標籤
                 lines.append(f"[Speaker] {text}")
 
             if lines:
