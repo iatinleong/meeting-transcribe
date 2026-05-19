@@ -7,4 +7,13 @@ sounddevice
 numpy
 python-dotenv
 deepfilternet
-funasr
+# funasr and its manually-resolved deps (editdistance has no py3.13 wheel)
+funasr --no-deps
+kaldiio
+torch_complex
+tensorboardX
+hydra-core>=1.3.2
+jaconv
+jamo
+jieba
+modelscope
