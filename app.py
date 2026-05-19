@@ -47,18 +47,6 @@ def load_transcriber(model_type: str):
     return Transcriber(model_type=model_type)
 
 
-@st.cache_resource
-def load_sepformer():
-    from speechbrain.inference.separation import SepformerSeparation
-    from speechbrain.utils.fetching import LocalStrategy
-    device_str = "cuda" if torch.cuda.is_available() else "cpu"
-    return SepformerSeparation.from_hparams(
-        source="speechbrain/sepformer-wham16k-enhancement",
-        savedir="pretrained_models/sepformer-wham16k-enhancement",
-        run_opts={"device": device_str},
-        local_strategy=LocalStrategy.COPY,
-    )
-
 
 st.title("Meeting Assistant - Streaming Demo")
 st.markdown(
@@ -114,8 +102,8 @@ with col1:
     st.subheader("Enhancement")
     enhancement_model = st.selectbox(
         "Enhancement model",
-        ["None", "DeepFilterNet3", "SepFormer"],
-        help="None: no processing. DeepFilterNet3: neural noise suppression. SepFormer: speech separation.",
+        ["None", "DeepFilterNet3"],
+        help="None: no processing. DeepFilterNet3: high-pass filter + neural noise suppression.",
     )
     if enhancement_model == "DeepFilterNet3":
         highpass_cutoff = st.slider(
@@ -234,31 +222,6 @@ def apply_enhancement(audio_raw: np.ndarray, sr: int, enhancement: str) -> np.nd
         audio_48k = torchaudio.functional.resample(audio_t, sr, df_state.sr())
         enhanced_48k = df_enhance(df_model, df_state, audio_48k, atten_lim_db=float(atten_lim_db))
         return torchaudio.functional.resample(enhanced_48k, df_state.sr(), sr).squeeze(0).numpy()
-
-    if enhancement == "SepFormer":
-        sepformer = load_sepformer()
-        output = audio_raw.copy()
-
-        # Run VAD first to find actual speech segments, then enhance only those
-        waveform = torch.from_numpy(audio_raw).unsqueeze(0).float()
-        vad_results = vad_pipeline({"waveform": waveform, "sample_rate": sr})
-        vad_pipeline.instantiate({"min_duration_on": 0.1, "min_duration_off": 0.1})
-
-        for speech in vad_results.get_timeline().support():
-            start = int(speech.start * sr)
-            end = int(speech.end * sr)
-            segment = audio_raw[start:end]
-            if len(segment) < int(sr * 0.1):
-                continue
-            audio_t = torch.from_numpy(segment).float().unsqueeze(0)
-            enhanced = sepformer.separate_batch(audio_t)
-            out = enhanced[0, :, 0] if enhanced.dim() == 3 else enhanced[0]
-            enhanced_np = out.detach().cpu().numpy()
-            # SepFormer may return slightly different length due to encoder padding
-            length = min(len(enhanced_np), end - start)
-            output[start : start + length] = enhanced_np[:length]
-
-        return output
 
     return audio_raw
 
