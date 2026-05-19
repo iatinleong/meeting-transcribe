@@ -237,11 +237,16 @@ def apply_enhancement(audio_raw: np.ndarray, sr: int, enhancement: str) -> np.nd
 
     if enhancement == "SepFormer":
         sepformer = load_sepformer()
-        audio_t = torch.from_numpy(audio_raw).float().unsqueeze(0)  # (1, N)
-        enhanced = sepformer.separate_batch(audio_t)               # (1, N, sources)
-        if enhanced.dim() == 3:
-            return enhanced[0, :, 0].detach().cpu().numpy()
-        return enhanced[0].detach().cpu().numpy()
+        # SepFormer self-attention is O(N²) — chunk to 4-second windows to avoid OOM
+        chunk_samples = 4 * sr
+        results = []
+        for start in range(0, len(audio_raw), chunk_samples):
+            chunk = audio_raw[start : start + chunk_samples]
+            audio_t = torch.from_numpy(chunk).float().unsqueeze(0)  # (1, N)
+            enhanced = sepformer.separate_batch(audio_t)
+            out = enhanced[0, :, 0] if enhanced.dim() == 3 else enhanced[0]
+            results.append(out.detach().cpu().numpy())
+        return np.concatenate(results)
 
     return audio_raw
 
